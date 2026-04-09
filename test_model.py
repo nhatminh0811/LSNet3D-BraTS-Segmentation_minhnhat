@@ -51,6 +51,25 @@ def sliding_window_inference(image, model, window_size=128, overlap=0.5):
 # ==========================================================
 # 2. UTILITY: Load BraTS (Ensure correct normalization)
 # ==========================================================
+def _standardize_brats_image(data):
+    if data.ndim != 4:
+        raise ValueError(f"Expected 4D BraTS image, got shape {data.shape}")
+
+    modality_axes = [i for i, s in enumerate(data.shape) if s == 4]
+    if len(modality_axes) != 1:
+        raise ValueError(f"Cannot determine modality axis for BraTS image shape {data.shape}")
+
+    mod_axis = modality_axes[0]
+    other_axes = [i for i in range(4) if i != mod_axis]
+    spatial_sizes = [data.shape[i] for i in other_axes]
+    if sorted(spatial_sizes) != [155, 240, 240]:
+        raise ValueError(f"Unexpected spatial size for BraTS image: {data.shape}")
+
+    d_axis = other_axes[spatial_sizes.index(155)]
+    reorder = [mod_axis, d_axis] + [i for i in other_axes if i != d_axis]
+    return np.transpose(data, reorder)
+
+
 def load_brats_case(input_path):
     # Check if input_path is a folder (old format) or file (nnU-Net format)
     if os.path.isdir(input_path):
@@ -76,20 +95,47 @@ def load_brats_case(input_path):
                 data[mask] = (data[mask] - data[mask].mean()) / (data[mask].std() + 1e-8)
             images.append(data)
 
-        # Return shape (C, H, W, D)
-        return torch.from_numpy(np.stack(images, axis=0))
+        # Return canonical shape (C, D, H, W)
+        return torch.from_numpy(np.stack(images, axis=0)).permute(0, 3, 1, 2)
     else:
         # nnU-Net format: single 4D .nii.gz file
-        data = nib.load(input_path).get_fdata().astype(np.float32)  # Shape: (D, H, W, 4)
-        
-        # Z-score normalization for each modality
+        data = nib.load(input_path).get_fdata().astype(np.float32)
+        data = _standardize_brats_image(data)
+
+        normalized = data.copy()
         for i in range(4):
-            mask = data[..., i] > 0
+            mask = normalized[i] > 0
             if mask.any():
-                data[..., i][mask] = (data[..., i][mask] - data[..., i][mask].mean()) / (data[..., i][mask].std() + 1e-8)
-        
-        # Return shape (C, H, W, D) to match old-format expectations
-        return torch.from_numpy(np.transpose(data, (3, 0, 1, 2)))
+                normalized[i][mask] = (normalized[i][mask] - normalized[i][mask].mean()) / (normalized[i][mask].std() + 1e-8)
+
+        # Return canonical shape (C, D, H, W)
+        return torch.from_numpy(normalized)
+
+
+def _fix_segmentation_shape(seg):
+    if seg.ndim != 3:
+        raise ValueError(f"Expected 3D segmentation, got shape {seg.shape}")
+
+    if seg.shape == (155, 240, 240):
+        return seg
+    if seg.shape == (240, 240, 155):
+        return np.transpose(seg, (2, 0, 1))
+    if seg.shape == (240, 155, 240):
+        return np.transpose(seg, (1, 2, 0))
+    if seg.shape == (155, 240, 240):
+        return seg
+
+    # If one axis equals 155 and others equal 240, infer correct orientation
+    if sorted(seg.shape) == [155, 240, 240]:
+        axis = seg.shape.index(155)
+        if axis == 0:
+            return seg
+        if axis == 1:
+            return np.transpose(seg, (1, 2, 0))
+        if axis == 2:
+            return np.transpose(seg, (2, 0, 1))
+
+    raise ValueError(f"Cannot infer D,H,W order for segmentation with shape {seg.shape}")
 
 
 def load_brats_seg(input_path):
@@ -113,9 +159,7 @@ def load_brats_seg(input_path):
     else:
         # nnU-Net format: single .nii.gz file
         seg = nib.load(input_path).get_fdata().astype(np.int64)
-        # Ensure shape is (D, H, W) = (155, 240, 240)
-        if seg.shape == (240, 240, 155):
-            seg = np.transpose(seg, (2, 0, 1))
+        seg = _fix_segmentation_shape(seg)
         seg_mapped = np.zeros_like(seg, dtype=np.int64)
         seg_mapped[seg == 1] = 1
         seg_mapped[seg == 2] = 2
@@ -140,15 +184,27 @@ def _prob_to_mask(pred_probs):
     return mask
 
 
+def _overlay_segmentation(image_slice, seg_mask, alpha=0.45):
+    """Overlay segmentation mask on a gray brain slice."""
+    cmap = mcolors.ListedColormap(['black', 'red', 'green', 'blue'])
+    norm = mcolors.BoundaryNorm([0, 1, 2, 3, 4], cmap.N)
+    overlay = np.zeros((seg_mask.shape[0], seg_mask.shape[1], 4), dtype=np.float32)
+
+    for label_val, color in enumerate([[0, 0, 0, 0], [1, 0, 0, alpha], [0, 1, 0, alpha], [0, 0, 1, alpha]]):
+        if label_val == 0:
+            continue
+        mask = seg_mask == label_val
+        overlay[mask] = color
+
+    return overlay
+
+
 def visualize_full_report(image_tensor, pred_probs, gt_seg=None, save_path="BraTS_Final_Report.png"):
     # 1. Convert prediction probabilities to mask
     pred_mask = _prob_to_mask(pred_probs)
 
-    cmap = mcolors.ListedColormap(['black', 'red', 'green', 'blue'])
-    norm = mcolors.BoundaryNorm([0, 1, 2, 3, 4], cmap.N)
-
-    # Convert original image to (C, D, H, W)
-    image_np = image_tensor.permute(0, 3, 1, 2).cpu().numpy()
+    # 2. Convert original image to (C, D, H, W)
+    image_np = image_tensor.cpu().numpy()
 
     # Use prediction mask to determine best tumor slices
     tumor_axial = np.sum(pred_mask > 0, axis=(1, 2))
@@ -163,7 +219,7 @@ def visualize_full_report(image_tensor, pred_probs, gt_seg=None, save_path="BraT
     if gt_seg is not None:
         gt_mask = gt_seg.squeeze(0).cpu().numpy().astype(np.int32)
 
-    fig, axs = plt.subplots(3, 6, figsize=(26, 14), facecolor='black')
+    fig, axs = plt.subplots(3, 6, figsize=(28, 14), facecolor='black')
     plt.subplots_adjust(wspace=0.05, hspace=0.1)
 
     views = [
@@ -172,7 +228,8 @@ def visualize_full_report(image_tensor, pred_probs, gt_seg=None, save_path="BraT
         ('SAGITTAL', lambda m: np.rot90(m[:, :, idx_sagittal]))
     ]
 
-    titles = ['T1', 'T1ce', 'T2', 'FLAIR', 'PREDICTION', 'GT']
+    titles = ['T1', 'T1ce', 'T2', 'FLAIR', 'PRED OVERLAY', 'GT OVERLAY']
+    overlay_background = image_np[3]  # FLAIR is often best for tumor visibility
 
     for row, (view_name, get_slice) in enumerate(views):
         for col in range(4):
@@ -181,20 +238,29 @@ def visualize_full_report(image_tensor, pred_probs, gt_seg=None, save_path="BraT
             if row == 0:
                 axs[row, col].set_title(titles[col], color='white', fontsize=16)
 
-        axs[row, 4].imshow(get_slice(pred_mask), cmap=cmap, norm=norm, interpolation='nearest', aspect='auto')
+        # Prediction overlay on the brain image
+        bg = get_slice(overlay_background)
+        pred2d = get_slice(pred_mask)
+        overlay_pred = _overlay_segmentation(bg, pred2d)
+        axs[row, 4].imshow(bg, cmap='gray', vmin=-2, vmax=2, aspect='auto')
+        axs[row, 4].imshow(overlay_pred)
         axs[row, 4].axis('off')
         if row == 0:
             axs[row, 4].set_title(titles[4], color='cyan', fontsize=16, fontweight='bold')
 
+        # Ground truth overlay on the brain image
         if gt_mask is not None:
-            axs[row, 5].imshow(get_slice(gt_mask), cmap=cmap, norm=norm, interpolation='nearest', aspect='auto')
+            gt2d = get_slice(gt_mask)
+            overlay_gt = _overlay_segmentation(bg, gt2d, alpha=0.35)
+            axs[row, 5].imshow(bg, cmap='gray', vmin=-2, vmax=2, aspect='auto')
+            axs[row, 5].imshow(overlay_gt)
             axs[row, 5].axis('off')
             if row == 0:
                 axs[row, 5].set_title(titles[5], color='lime', fontsize=16, fontweight='bold')
 
         axs[row, 0].text(-20, 120, view_name, color='yellow', rotation=90, va='center', fontsize=14, fontweight='bold')
 
-    plt.suptitle("BraTS: Prediction vs GT", color='white', fontsize=24, y=0.98)
+    plt.suptitle("BraTS: Prediction Overlay vs Ground Truth", color='white', fontsize=24, y=0.98)
     plt.savefig(save_path, facecolor='black', bbox_inches='tight')
     print(f"✓ Full report saved at: {save_path}")
 
@@ -233,7 +299,7 @@ def load_test_cases(base_dir, test_list_path="test_patients_list.txt"):
                 raise FileNotFoundError(f"Test case folder does not exist: {folder}")
             case_folders.append(folder)
         return case_folders
-
+    
 
 def run_main():
     checkpoint_path = "./weight/BraTS/best_model_epoch=82_dice=0.8275.ckpt"  # Replace with your .ckpt file
@@ -283,7 +349,7 @@ def run_main():
             img_tensor = load_brats_case(case_folder)
             seg_tensor = load_brats_seg(case_folder).unsqueeze(0)  # (1, D, H, W)
 
-        input_batch = img_tensor.permute(0, 3, 1, 2).unsqueeze(0).to(device)
+        input_batch = img_tensor.unsqueeze(0).to(device)
 
         with torch.no_grad():
             preds = sliding_window_inference(input_batch, segmentor, window_size=128, overlap=0.5)

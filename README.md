@@ -145,12 +145,29 @@ python test_model.py
   - Whole tumor (WT)
 - also includes optional Hausdorff distance (HD95) support if `scipy` is installed
 
+## Results & Visualization
+
+### Training Metrics
+The model training produces comprehensive metric tracking across validation stages:
+
+![Training Results](my_lsnet_3d_results.png)
+
+### Inference Visualization
+Example segmentation output showing multi-view visualization with brain overlays:
+- Left columns: Original T1, T1ce, T2, FLAIR modalities
+- Middle: Predicted segmentation overlay on brain images
+- Right: Ground truth segmentation overlay
+- Color mapping: Red (NCR/NET), Green (Edema), Blue (Enhancing Tumor)
+
+![BraTS Test Case 471](test_outputs/BraTS_Test_471_Final.png)
+
 ## Notes
 
 - The model expects 4-channel MRI input: T1, T1ce, T2, FLAIR
 - Output is a 4-class segmentation map with labels: background, NCR/NET, edema, enhancing tumor
 - Data normalization is applied per modality using brain region statistics
 - Smart cropping focuses training on tumor-containing regions while preserving random background crops
+- Segmentation overlays display predictions and ground truth directly on brain tissue for clinical interpretability
 
 ## Contact
 
